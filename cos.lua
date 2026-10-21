@@ -4,6 +4,7 @@
 -- Added: Anti-Ragdoll system
 -- Added: Fullbright system
 -- Added: Anti-Grab & Anti-Control (blocks foreign BodyMovers, Welds, Anchors, Fling, Sit)
+-- Added: Fling (touch = launch) + TP-to-player in fling range + Brute Mode (auto nearest-player fling)
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -32,6 +33,8 @@ local settings = {
     antiragdoll = false,
     fullbright = false,
     antigrab = false,
+    fling = false,
+    brute = false,
     brightnessValue = 5
 }
 
@@ -180,18 +183,23 @@ local function createButton(name, key, callback)
     dot.ZIndex = 14
     Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
 
+    local function setVisual(enabled)
+        TweenService:Create(indicator, TweenInfo.new(0.2), {BackgroundColor3 = enabled and Color3.fromRGB(0, 120, 255) or Color3.fromRGB(40, 42, 48)}):Play()
+        TweenService:Create(dot, TweenInfo.new(0.2), {
+            Position = enabled and UDim2.new(1, -15, 0.5, -6) or UDim2.new(0, 3, 0.5, -6),
+            BackgroundColor3 = enabled and Color3.new(1,1,1) or Color3.fromRGB(150, 150, 150)
+        }):Play()
+    end
+
     btn.MouseButton1Click:Connect(function()
         if key ~= "none" then
             settings[key] = not settings[key]
-            local enabled = settings[key]
-            TweenService:Create(indicator, TweenInfo.new(0.2), {BackgroundColor3 = enabled and Color3.fromRGB(0, 120, 255) or Color3.fromRGB(40, 42, 48)}):Play()
-            TweenService:Create(dot, TweenInfo.new(0.2), {
-                Position = enabled and UDim2.new(1, -15, 0.5, -6) or UDim2.new(0, 3, 0.5, -6),
-                BackgroundColor3 = enabled and Color3.new(1,1,1) or Color3.fromRGB(150, 150, 150)
-            }):Play()
+            setVisual(settings[key])
         end
         if callback then pcall(function() callback(settings[key]) end) end
     end)
+
+    return setVisual
 end
 
 local function createSlider(name, min, max, settingKey, callback)
@@ -778,14 +786,14 @@ local function setupAntiGrab(char)
         hum.AutoRotate = true
         
         -- 5. Anti-Fling: resetujemy gwałtowną prędkość
-        if hrp.AssemblyLinearVelocity.Magnitude > 500 or hrp.AssemblyAngularVelocity.Magnitude > 500 then
+        if not settings.fling and (hrp.AssemblyLinearVelocity.Magnitude > 500 or hrp.AssemblyAngularVelocity.Magnitude > 500) then
             hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
             hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
         end
         
         -- 6. Anti-Teleport: jeśli ktoś nas teleportuje gwałtownie (>300 studów w 1 klatce)
         -- Pomijamy gdy używamy własnych systemów ruchu lub latamy
-        if not settings.fly and not settings.noclip and not settings.godlyNoclip then
+        if not settings.fly and not settings.noclip and not settings.godlyNoclip and not settings.fling then
             local currentPos = hrp.Position
             local dist = (currentPos - lastPos).Magnitude
             
@@ -916,6 +924,123 @@ local function toggleKillAura(state)
     end
 end
 
+-- FLING SYSTEM
+local flingCooldown = {}
+local bruteRun = 0
+local flingSetVisual, bruteSetVisual
+
+local function setupFling()
+    clearConnection("fling")
+    connections.fling = RunService.Heartbeat:Connect(function()
+        local hrp = getRootPart(player.Character)
+        if not hrp then return end
+        local vel = hrp.AssemblyLinearVelocity
+        hrp.AssemblyAngularVelocity = Vector3.new(0, 99999, 0)
+        hrp.AssemblyLinearVelocity = vel * 10000 + Vector3.new(0, 10000, 0)
+        RunService.RenderStepped:Wait()
+        if hrp.Parent then
+            hrp.AssemblyLinearVelocity = vel
+            hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+        end
+        RunService.Stepped:Wait()
+        if hrp.Parent then
+            hrp.AssemblyLinearVelocity = vel + Vector3.new(0, 0.1, 0)
+        end
+    end)
+end
+
+-- sticks to target until launched / timeout
+local function flingPlayer(p, maxTime, stopIf)
+    local tHum = p and p.Character and getHumanoid(p.Character)
+    local tHrp = p and p.Character and getRootPart(p.Character)
+    if not tHrp or not tHum or tHum.Health <= 0 then return false end
+
+    local startPos = tHrp.Position
+    local t0 = os.clock()
+    local launched = false
+
+    while settings.fling and os.clock() - t0 < (maxTime or 2) do
+        if stopIf and stopIf() then break end
+        local myHrp = getRootPart(player.Character)
+        tHrp = p.Character and getRootPart(p.Character)
+        if not myHrp or not tHrp then break end
+
+        if (tHrp.Position - startPos).Magnitude > 300 or tHrp.Position.Y < -400 or tHrp.AssemblyLinearVelocity.Magnitude > 500 then
+            launched = true
+            break
+        end
+
+        myHrp.CFrame = CFrame.new(tHrp.Position + tHrp.AssemblyLinearVelocity * 0.08)
+        RunService.Heartbeat:Wait()
+    end
+
+    local myHrp = getRootPart(player.Character)
+    if myHrp then
+        myHrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        myHrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+    end
+    return launched
+end
+
+local function nearestTarget()
+    local hrp = getRootPart(player.Character)
+    if not hrp then return nil end
+    local best, bestD
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character and (flingCooldown[p] or 0) < os.clock() then
+            local h, hum = getRootPart(p.Character), getHumanoid(p.Character)
+            if h and hum and hum.Health > 0 then
+                local d = (h.Position - hrp.Position).Magnitude
+                if not bestD or d < bestD then best, bestD = p, d end
+            end
+        end
+    end
+    return best
+end
+
+local function toggleBrute(state)
+    bruteRun += 1
+    local id = bruteRun
+    if not state then return end
+
+    if not settings.fling then
+        settings.fling = true
+        if flingSetVisual then flingSetVisual(true) end
+        setupFling()
+    end
+
+    task.spawn(function()
+        while settings.brute and bruteRun == id do
+            local target = nearestTarget()
+            if target then
+                flingPlayer(target, 2, function() return not settings.brute or bruteRun ~= id end)
+                flingCooldown[target] = os.clock() + 3
+            else
+                task.wait(0.3)
+            end
+            task.wait()
+        end
+    end)
+end
+
+local function toggleFling(state)
+    if state then
+        setupFling()
+    else
+        clearConnection("fling")
+        if settings.brute then
+            settings.brute = false
+            bruteRun += 1
+            if bruteSetVisual then bruteSetVisual(false) end
+        end
+        local hrp = getRootPart(player.Character)
+        if hrp then
+            hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+            hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        end
+    end
+end
+
 -- CHARACTER RESPAWN HANDLER
 local function onCharacterAdded(char)
     task.wait(0.5)
@@ -963,6 +1088,9 @@ createSlider("Brightness", 1, 20, "brightnessValue", function(val)
     end
 end)
 createButton("🛡️ Anti-Grab & Control", "antigrab", toggleAntiGrab)
+
+flingSetVisual = createButton("💥 Fling", "fling", toggleFling)
+bruteSetVisual = createButton("😈 Brute Mode", "brute", toggleBrute)
 
 createButton("⚔ Kill Aura", "killaura", toggleKillAura)
 createSlider("Aura Range", 5, 50, "auraRange", nil)
@@ -1075,8 +1203,13 @@ createButton("📍 Teleport to Player", "none", function()
                     local myHrp = getRootPart(myChar)
                     
                     if targetHrp and myHrp then
-                        myHrp.CFrame = targetHrp.CFrame * CFrame.new(0, 0, 3)
+                        if settings.fling then
+                            task.spawn(flingPlayer, p, 1.5)
+                        else
+                            myHrp.CFrame = targetHrp.CFrame * CFrame.new(0, 0, 3)
+                        end
                     end
+
                     pFrame:Destroy()
                 end)
             end
@@ -1154,6 +1287,12 @@ ScreenGui.Destroying:Connect(function()
 
     -- Reset speed loop
     clearConnection("speedLoop")
+
+    -- Reset fling / brute
+    settings.fling = false
+    settings.brute = false
+    bruteRun += 1
+    clearConnection("fling")
 end)
 
 print("[OMNI PRO] v18.2.3 LOADED - ALL SYSTEMS OPERATIONAL")
